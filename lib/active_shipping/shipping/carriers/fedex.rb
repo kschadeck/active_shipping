@@ -3,25 +3,25 @@
 
 module ActiveMerchant
   module Shipping
-    
+
     # :key is your developer API key
     # :password is your API password
     # :account is your FedEx account number
     # :login is your meter number
     class FedEx < Carrier
       self.retry_safe = true
-      
+
       cattr_reader :name
       @@name = "FedEx"
-      
+
       TEST_URL = 'https://gatewaybeta.fedex.com:443/xml'
       LIVE_URL = 'https://gateway.fedex.com:443/xml'
-      
+
       CarrierCodes = {
         "fedex_ground" => "FDXG",
         "fedex_express" => "FDXE"
       }
-      
+
       ServiceTypes = {
         "PRIORITY_OVERNIGHT" => "FedEx Priority Overnight",
         "PRIORITY_OVERNIGHT_SATURDAY_DELIVERY" => "FedEx Priority Overnight Saturday Delivery",
@@ -72,7 +72,7 @@ module ActiveMerchant
         'third_party' => 'THIRDPARTY',
         'collect' => 'COLLECT'
       }
-      
+
       PackageIdentifierTypes = {
         'tracking_number' => 'TRACKING_NUMBER_OR_DOORTAG',
         'door_tag' => 'TRACKING_NUMBER_OR_DOORTAG',
@@ -85,127 +85,144 @@ module ActiveMerchant
         'express_mps_master' => 'EXPRESS_MPS_MASTER'
       }
 
-      # FedEx tracking codes as described in the FedEx Tracking Service WSDL Guide
-      # All delays also have been marked as exceptions
-      TRACKING_STATUS_CODES = HashWithIndifferentAccess.new({
-        'AA' => :at_airport,
-        'AD' => :at_delivery,
-        'AF' => :at_fedex_facility,
-        'AR' => :at_fedex_facility,
-        'AP' => :at_pickup,
-        'CA' => :canceled,
-        'CH' => :location_changed,
-        'DE' => :exception,
-        'DL' => :delivered,
-        'DP' => :departed_fedex_location,
-        'DR' => :vehicle_furnished_not_used,
-        'DS' => :vehicle_dispatched,
-        'DY' => :exception,
-        'EA' => :exception,
-        'ED' => :enroute_to_delivery,
-        'EO' => :enroute_to_origin_airport,
-        'EP' => :enroute_to_pickup,
-        'FD' => :at_fedex_destination,
-        'HL' => :held_at_location,
-        'IT' => :in_transit,
-        'LO' => :left_origin,
-        'OC' => :order_created,
-        'OD' => :out_for_delivery,
-        'PF' => :plane_in_flight,
-        'PL' => :plane_landed,
-        'PU' => :picked_up,
-        'RS' => :return_to_shipper,
-        'SE' => :exception,
-        'SF' => :at_sort_facility,
-        'SP' => :split_status,
-        'TR' => :transfer
-      })
-
       def self.service_name_for_code(service_code)
         ServiceTypes[service_code] || "FedEx #{service_code.titleize.sub(/Fedex /, '')}"
       end
-      
+
       def requirements
         [:key, :password, :account, :login]
       end
-      
+
       def find_rates(origin, destination, packages, options = {})
         options = @options.update(options)
         packages = Array(packages)
-        
+
         rate_request = build_rate_request(origin, destination, packages, options)
-        
-        response = commit(save_request(rate_request), (options[:test] || false)).gsub(/<(\/)?.*?\:(.*?)>/, '<\1\2>')
-        
+
+        response = commit(save_request(rate_request), (options[:test] || false))
+
         parse_rate_response(origin, destination, packages, response, options)
       end
-      
+
       def find_tracking_info(tracking_number, options={})
         options = @options.update(options)
-        
+
         tracking_request = build_tracking_request(tracking_number, options)
         response = commit(save_request(tracking_request), (options[:test] || false)).gsub(/<(\/)?.*?\:(.*?)>/, '<\1\2>')
         parse_tracking_response(response, options)
       end
-      
+
       protected
+
       def build_rate_request(origin, destination, packages, options={})
         imperial = ['US','LR','MM'].include?(origin.country_code(:alpha2))
 
-        xml_request = XmlNode.new('RateRequest', 'xmlns' => 'http://fedex.com/ws/rate/v6') do |root_node|
-          root_node << build_request_header
+        xml_request = Nokogiri::XML::Builder.new do
+          RateRequest(:xmlns => 'http://fedex.com/ws/rate/v6') {
+            # Header Information
+            WebAuthenticationDetail {
+              UserCredential {
+                Key options[:key]
+                Password options[:password]
+              }
+            }
+            ClientDetail {
+              AccountNumber options[:account]
+              MeterNumber options[:login]
+            }
+            TransactionDetail {
+              CustomerTransactionId 'ActiveShipping'
+            }
 
-          # Version
-          root_node << XmlNode.new('Version') do |version_node|
-            version_node << XmlNode.new('ServiceId', 'crs')
-            version_node << XmlNode.new('Major', '6')
-            version_node << XmlNode.new('Intermediate', '0')
-            version_node << XmlNode.new('Minor', '0')
-          end
-          
-          # Returns delivery dates
-          root_node << XmlNode.new('ReturnTransitAndCommit', true)
-          # Returns saturday delivery shipping options when available
-          root_node << XmlNode.new('VariableOptions', 'SATURDAY_DELIVERY')
-          
-          root_node << XmlNode.new('RequestedShipment') do |rs|
-            rs << XmlNode.new('ShipTimestamp', Time.now)
-            rs << XmlNode.new('DropoffType', options[:dropoff_type] || 'REGULAR_PICKUP')
-            rs << XmlNode.new('PackagingType', options[:packaging_type] || 'YOUR_PACKAGING')
-            
-            rs << build_location_node('Shipper', (options[:shipper] || origin))
-            rs << build_location_node('Recipient', destination)
-            if options[:shipper] and options[:shipper] != origin
-              rs << build_location_node('Origin', origin)
-            end
-            
-            rs << XmlNode.new('RateRequestTypes', 'ACCOUNT')
-            rs << XmlNode.new('PackageCount', packages.size)
-            packages.each do |pkg|
-              rs << XmlNode.new('RequestedPackages') do |rps|
-                rps << XmlNode.new('Weight') do |tw|
-                  tw << XmlNode.new('Units', imperial ? 'LB' : 'KG')
-                  tw << XmlNode.new('Value', [((imperial ? pkg.lbs : pkg.kgs).to_f*1000).round/1000.0, 0.1].max)
-                end
-                rps << XmlNode.new('Dimensions') do |dimensions|
-                  [:length,:width,:height].each do |axis|
-                    value = ((imperial ? pkg.inches(axis) : pkg.cm(axis)).to_f*1000).round/1000.0 # 3 decimals
-                    dimensions << XmlNode.new(axis.to_s.capitalize, value.ceil)
+            # Version
+            Version {
+              ServiceId 'crs'
+              Major '6'
+              Intermediate '0'
+              Minor '0'
+            }
+
+            # Returns Delivery Dates
+            ReturnTransitAndCommit true
+            # Returns saturday delivery shipping options when available
+            VariableOptions 'SATURDAY_DELIVERY'
+
+            RequestedShipment {
+              ShipTimestamp Time.now.xmlschema
+              DropoffType options[:dropoff_type] || 'REGULAR_PICKUP'
+              PackagingType options[:packaging_type] || 'YOUR_PACKAGING'
+
+              Shipper {
+                location = (options[:shipper] || origin)
+                Address {
+                  PostalCode location.postal_code
+                  CountryCode location.country_code(:alpha2)
+                  case location.address_type
+                    when 'commercial' then Residential false
+                    when 'residential' then Residential true
                   end
-                  dimensions << XmlNode.new('Units', imperial ? 'IN' : 'CM')
-                end
+                }
+              }
+              Recipient {
+                location = destination
+                Address {
+                  PostalCode location.postal_code
+                  CountryCode location.country_code(:alpha2)
+                  case location.address_type
+                    when 'commercial' then Residential false
+                    when 'residential' then Residential true
+                  end
+                }
+              }
+              if options[:shipper] and options[:shipper] != origin
+                Origin {
+                  location = origin
+                  Address {
+                    PostalCode location.postal_code
+                    CountryCode location.country_code(:alpha2)
+                    case location.address_type
+                      when 'commercial' then Residential false
+                      when 'residential' then Residential true
+                    end
+                  }
+                }
               end
-            end
-            
-          end
+
+              #package
+              RateRequestTypes 'ACCOUNT'
+              PackageCount packages.size
+
+              packages.each do |pkg|
+                RequestedPackages {
+                  Weight {
+                    Units imperial ? 'LB' : 'KG'
+                    Value [((imperial ? pkg.lbs : pkg.kgs).to_f*1000).round/1000.0, 0.1].max
+                  }
+                  Dimensions {
+                    if imperial
+                      Length(((pkg.inches(:length).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Width(((pkg.inches(:width).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Height(((pkg.inches(:height).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Units 'IN'
+                    else
+                      Length(((pkg.cm(:length).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Width(((pkg.cm(:width).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Height(((pkg.cm(:height).to_f * 1000.0).round / 1000.0).ceil) # 3 decimals
+                      Units 'CM'
+                    end
+                  }
+                }
+              end
+            }
+          }
         end
-        xml_request.to_s
+        xml_request.to_xml
       end
-      
+
       def build_tracking_request(tracking_number, options={})
         xml_request = XmlNode.new('TrackRequest', 'xmlns' => 'http://fedex.com/ws/track/v3') do |root_node|
           root_node << build_request_header
-          
+
           # Version
           root_node << XmlNode.new('Version') do |version_node|
             version_node << XmlNode.new('ServiceId', 'trck')
@@ -213,19 +230,19 @@ module ActiveMerchant
             version_node << XmlNode.new('Intermediate', '0')
             version_node << XmlNode.new('Minor', '0')
           end
-          
+
           root_node << XmlNode.new('PackageIdentifier') do |package_node|
             package_node << XmlNode.new('Value', tracking_number)
             package_node << XmlNode.new('Type', PackageIdentifierTypes[options['package_identifier_type'] || 'tracking_number'])
           end
-          
+
           root_node << XmlNode.new('ShipDateRangeBegin', options['ship_date_range_begin']) if options['ship_date_range_begin']
           root_node << XmlNode.new('ShipDateRangeEnd', options['ship_date_range_end']) if options['ship_date_range_end']
           root_node << XmlNode.new('IncludeDetailedScans', 1)
         end
         xml_request.to_s
       end
-      
+
       def build_request_header
         web_authentication_detail = XmlNode.new('WebAuthenticationDetail') do |wad|
           wad << XmlNode.new('UserCredential') do |uc|
@@ -233,115 +250,85 @@ module ActiveMerchant
             uc << XmlNode.new('Password', @options[:password])
           end
         end
-        
+
         client_detail = XmlNode.new('ClientDetail') do |cd|
           cd << XmlNode.new('AccountNumber', @options[:account])
           cd << XmlNode.new('MeterNumber', @options[:login])
         end
-        
+
         trasaction_detail = XmlNode.new('TransactionDetail') do |td|
           td << XmlNode.new('CustomerTransactionId', 'ActiveShipping') # TODO: Need to do something better with this..
         end
-        
+
         [web_authentication_detail, client_detail, trasaction_detail]
       end
-            
-      def build_location_node(name, location)
-        location_node = XmlNode.new(name) do |xml_node|
-          xml_node << XmlNode.new('Address') do |address_node|
-            address_node << XmlNode.new('PostalCode', location.postal_code)
-            address_node << XmlNode.new("CountryCode", location.country_code(:alpha2))
 
-            address_node << XmlNode.new("Residential", true) unless location.commercial?
-          end
-        end
-      end
-      
       def parse_rate_response(origin, destination, packages, response, options)
         rate_estimates = []
-        success, message = nil
-        
-        xml = REXML::Document.new(response)
-        root_node = xml.elements['RateReply']
-        
-        success = response_success?(xml)
-        message = response_message(xml)
-        
-        root_node.elements.each('RateReplyDetails') do |rated_shipment|
-          service_code = rated_shipment.get_text('ServiceType').to_s
-          is_saturday_delivery = rated_shipment.get_text('AppliedOptions').to_s == 'SATURDAY_DELIVERY'
-          service_type = is_saturday_delivery ? "#{service_code}_SATURDAY_DELIVERY" : service_code
-          
-          currency = handle_incorrect_currency_codes(rated_shipment.get_text('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Currency').to_s)
-          rate_estimates << RateEstimate.new(origin, destination, @@name,
-                              self.class.service_name_for_code(service_type),
-                              :service_code => service_code,
-                              :total_price => rated_shipment.get_text('RatedShipmentDetails/ShipmentRateDetail/TotalNetCharge/Amount').to_s.to_f,
-                              :currency => currency,
-                              :packages => packages,
-                              :delivery_range => [rated_shipment.get_text('DeliveryTimestamp').to_s] * 2)
-	    end
-		
+        success = false
+        message = ''
+
+        xml = Nokogiri::XML::parse(response).remove_namespaces!()
+        xml.root.children.each do |node|
+          if node.name.eql?('Notifications')
+            success = %w{SUCCESS WARNING NOTE}.include? node.xpath('Severity').text
+            message = "#{node.xpath('Severity').text} - #{node.xpath('Code').text}: #{node.xpath('Message').text}"
+          elsif node.name.eql?('RateReplyDetails')
+            service_code = node.xpath('ServiceType').text
+            is_saturday_delivery = node.xpath('AppliedOptions').text.eql?('SATURDAY_DELIVERY')
+            service_type = is_saturday_delivery ? "#{service_code}_SATURDAY_DELIVERY" : service_code
+
+            rate_type = node.xpath('ActualRateType').text
+            rate_estimates << RateEstimate.new(origin, destination, @@name,
+              self.class.service_name_for_code(service_type),
+              :service_code => service_code,
+              :total_price => node.xpath('RatedShipmentDetails/ShipmentRateDetail[RateType="' + rate_type + '"]/TotalNetCharge/Amount').text.to_f,
+              :currency => node.xpath('RatedShipmentDetails/ShipmentRateDetail[RateType="' + rate_type + '"]/TotalNetCharge/Currency').text,
+              :packages => packages,
+              :delivery_date => node.xpath('DeliveryTimestamp').text)
+          end
+        end
+
         if rate_estimates.empty?
           success = false
           message = "No shipping rates could be found for the destination address" if message.blank?
         end
 
-        RateResponse.new(success, message, Hash.from_xml(response), :rates => rate_estimates, :xml => response, :request => last_request, :log_xml => options[:log_xml])
+        RateResponse.new(success, message, {}, :rates => rate_estimates, :xml => response, :request => last_request, :log_xml => options[:log_xml])
       end
-      
+
       def parse_tracking_response(response, options)
         xml = REXML::Document.new(response)
         root_node = xml.elements['TrackReply']
-        
+
         success = response_success?(xml)
         message = response_message(xml)
-        
+
         if success
-          tracking_number, origin, destination, status, status_code, status_description = nil
+          tracking_number, origin, destination = nil
           shipment_events = []
 
           tracking_details = root_node.elements['TrackDetails']
           tracking_number = tracking_details.get_text('TrackingNumber').to_s
-          
-          status_code = tracking_details.get_text('StatusCode').to_s
-          status_description = tracking_details.get_text('StatusDescription').to_s
-          status = TRACKING_STATUS_CODES[status_code]
-
-          origin_node = tracking_details.elements['OriginLocationAddress']
-        
-          if origin_node
-            origin = Location.new(
-                  :country =>     origin_node.get_text('CountryCode').to_s,
-                  :province =>    origin_node.get_text('StateOrProvinceCode').to_s,
-                  :city =>        origin_node.get_text('City').to_s
-            )
-          end
 
           destination_node = tracking_details.elements['DestinationAddress']
-
-          if destination_node.nil?
-            destination_node = tracking_details.elements['ActualDeliveryAddress']
-          end
-
           destination = Location.new(
                 :country =>     destination_node.get_text('CountryCode').to_s,
                 :province =>    destination_node.get_text('StateOrProvinceCode').to_s,
                 :city =>        destination_node.get_text('City').to_s
               )
-          
-          tracking_details.elements.each('Events') do |event|
-            address  = event.elements['Address']
 
-            city     = address.get_text('City').to_s
-            state    = address.get_text('StateOrProvinceCode').to_s
-            zip_code = address.get_text('PostalCode').to_s
-            country  = address.get_text('CountryCode').to_s
-            next if country.blank?
+          tracking_details.elements.each('Events') do |event|
+            location = Location.new(
+              :city => event.elements['Address'].get_text('City').to_s,
+              :state => event.elements['Address'].get_text('StateOrProvinceCode').to_s,
+              :postal_code => event.elements['Address'].get_text('PostalCode').to_s,
+              :country => event.elements['Address'].get_text('CountryCode').to_s)
+            next if  country.blank?
             
             location = Location.new(:city => city, :state => state, :postal_code => zip_code, :country => country)
             description = event.get_text('EventDescription').to_s
-            
+
             # for now, just assume UTC, even though it probably isn't
             time = Time.parse("#{event.get_text('Timestamp').to_s}")
             zoneless_time = Time.utc(time.year, time.month, time.mday, time.hour, time.min, time.sec)
@@ -349,46 +336,36 @@ module ActiveMerchant
             shipment_events << ShipmentEvent.new(description, zoneless_time, location)
           end
           shipment_events = shipment_events.sort_by(&:time)
-
         end
-        
+
         TrackingResponse.new(success, message, Hash.from_xml(response),
-          :carrier => @@name,
           :xml => response,
           :request => last_request,
-          :status => status,
-          :status_code => status_code,
-          :status_description => status_description,
           :shipment_events => shipment_events,
-          :origin => origin,
           :destination => destination,
           :tracking_number => tracking_number
         )
       end
-            
+
       def response_status_node(document)
         document.elements['/*/Notifications/']
       end
-      
+
       def response_success?(document)
         %w{SUCCESS WARNING NOTE}.include? response_status_node(document).get_text('Severity').to_s
       end
-      
+
       def response_message(document)
         response_node = response_status_node(document)
-        "#{response_status_node(document).get_text('Severity')} - #{response_node.get_text('Code')}: #{response_node.get_text('Message')}"
+        "#{response_status_node(document).get_text('Severity').to_s} - #{response_node.get_text('Code').to_s}: #{response_node.get_text('Message').to_s}"
       end
-      
+
       def commit(request, test = false)
         ssl_post(test ? TEST_URL : LIVE_URL, request.gsub("\n",''))        
       end
       
-      def handle_incorrect_currency_codes(currency)
-        case currency
-        when /UKL/i then 'GBP'
-        when /SID/i then 'SGD'
-        else currency
-        end
+      def handle_uk_currency(currency)
+        currency =~ /UKL/i ? 'GBP' : currency
       end
     end
   end
